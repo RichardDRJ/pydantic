@@ -6,34 +6,18 @@ import sys
 from contextlib import contextmanager
 from dataclasses import is_dataclass
 from functools import cached_property, wraps
-from typing import (
-    Any,
-    Callable,
-    Generic,
-    Iterable,
-    Iterator,
-    Literal,
-    TypeVar,
-    cast,
-    final,
-    overload,
-)
+from typing import Any, Callable, Generic, Iterable, Iterator, Literal, TypeVar, cast, final, overload
 
 from pydantic_core import CoreSchema, SchemaSerializer, SchemaValidator, Some
 from typing_extensions import Concatenate, ParamSpec, is_typeddict
 
 from pydantic.errors import PydanticUserError
+from pydantic.hooks import CoreSchemaGeneratorFunction
 from pydantic.main import BaseModel, IncEx
 
 from ._internal import _config, _generate_schema, _mock_val_ser, _typing_extra, _utils
 from .config import ConfigDict
-from .json_schema import (
-    DEFAULT_REF_TEMPLATE,
-    GenerateJsonSchema,
-    JsonSchemaKeyT,
-    JsonSchemaMode,
-    JsonSchemaValue,
-)
+from .json_schema import DEFAULT_REF_TEMPLATE, GenerateJsonSchema, JsonSchemaKeyT, JsonSchemaMode, JsonSchemaValue
 from .plugin._schema_validator import PluggableSchemaValidator, create_schema_validator
 
 T = TypeVar('T')
@@ -42,7 +26,13 @@ P = ParamSpec('P')
 TypeAdapterT = TypeVar('TypeAdapterT', bound='TypeAdapter')
 
 
-def _get_schema(type_: Any, config_wrapper: _config.ConfigWrapper, parent_depth: int) -> CoreSchema:
+def _get_schema(
+    type_: Any,
+    config_wrapper: _config.ConfigWrapper,
+    parent_depth: int,
+    skip_schema_cache: bool = False,
+    schema_generation_hooks: list[CoreSchemaGeneratorFunction] | None = None,
+) -> CoreSchema:
     """`BaseModel` uses its own `__module__` to find out where it was defined
     and then looks for symbols to resolve forward references in those globals.
     On the other hand this function can be called with arbitrary objects,
@@ -89,8 +79,14 @@ def _get_schema(type_: Any, config_wrapper: _config.ConfigWrapper, parent_depth:
     local_ns = _typing_extra.parent_frame_namespace(parent_depth=parent_depth)
     global_ns = sys._getframe(max(parent_depth - 1, 1)).f_globals.copy()
     global_ns.update(local_ns or {})
-    gen = _generate_schema.GenerateSchema(config_wrapper, types_namespace=global_ns, typevars_map={})
-    schema = gen.generate_schema(type_)
+    gen = _generate_schema.GenerateSchema(
+        config_wrapper,
+        types_namespace=global_ns,
+        typevars_map={},
+        skip_schema_cache=skip_schema_cache,
+        schema_generation_hooks=schema_generation_hooks,
+    )
+    schema = gen.generate_schema(type_, not skip_schema_cache)
     schema = gen.clean_schema(schema)
     return schema
 
@@ -162,6 +158,7 @@ class TypeAdapter(Generic[T]):
         config: ConfigDict | None = ...,
         _parent_depth: int = ...,
         module: str | None = ...,
+        schema_generation_hooks: list[CoreSchemaGeneratorFunction] | None = ...,
     ) -> None: ...
 
     # This second overload is for unsupported special forms (such as Annotated, Union, etc.)
@@ -175,6 +172,7 @@ class TypeAdapter(Generic[T]):
         config: ConfigDict | None = ...,
         _parent_depth: int = ...,
         module: str | None = ...,
+        schema_generation_hooks: list[CoreSchemaGeneratorFunction] | None = ...,
     ) -> None: ...
 
     def __init__(
@@ -184,6 +182,7 @@ class TypeAdapter(Generic[T]):
         config: ConfigDict | None = None,
         _parent_depth: int = 2,
         module: str | None = None,
+        schema_generation_hooks: list[CoreSchemaGeneratorFunction] | None = None,
     ) -> None:
         """Initializes the TypeAdapter object.
 
@@ -192,6 +191,8 @@ class TypeAdapter(Generic[T]):
             config: Configuration for the `TypeAdapter`, should be a dictionary conforming to [`ConfigDict`][pydantic.config.ConfigDict].
             _parent_depth: depth at which to search the parent namespace to construct the local namespace.
             module: The module that passes to plugin if provided.
+            skip_schema_cache: Whether to freshly generate the schema for the adapted type or reuse cached values.
+            schema_generation_hooks: A list of generator hook functions which can be used to modify schema generation (e.g. by adding validation support for third-party types used in nested models).
 
         !!! note
             You cannot use the `config` argument when instantiating a `TypeAdapter` if the type you're using has its own
@@ -230,6 +231,8 @@ class TypeAdapter(Generic[T]):
         self._type = type
         self._config = config
         self._parent_depth = _parent_depth
+        self._schema_generation_hooks = schema_generation_hooks or []
+        self._skip_schema_cache = bool(schema_generation_hooks)
         if module is None:
             f = sys._getframe(1)
             self._module_name = cast(str, f.f_globals.get('__name__', ''))
@@ -257,25 +260,15 @@ class TypeAdapter(Generic[T]):
 
     @_frame_depth(1)
     def _init_core_attrs(self, rebuild_mocks: bool) -> None:
-        try:
-            self._core_schema = _getattr_no_parents(self._type, '__pydantic_core_schema__')
-            self._validator = _getattr_no_parents(self._type, '__pydantic_validator__')
-            self._serializer = _getattr_no_parents(self._type, '__pydantic_serializer__')
-        except AttributeError:
-            config_wrapper = _config.ConfigWrapper(self._config)
-            core_config = config_wrapper.core_config(None)
-
-            self._core_schema = _get_schema(self._type, config_wrapper, parent_depth=self._parent_depth)
-            self._validator = create_schema_validator(
-                schema=self._core_schema,
-                schema_type=self._type,
-                schema_type_module=self._module_name,
-                schema_type_name=str(self._type),
-                schema_kind='TypeAdapter',
-                config=core_config,
-                plugin_settings=config_wrapper.plugin_settings,
-            )
-            self._serializer = SchemaSerializer(self._core_schema, core_config)
+        if not self._skip_schema_cache:
+            try:
+                self._core_schema = _getattr_no_parents(self._type, '__pydantic_core_schema__')
+                self._validator = _getattr_no_parents(self._type, '__pydantic_validator__')
+                self._serializer = _getattr_no_parents(self._type, '__pydantic_serializer__')
+            except AttributeError:
+                self._create_core_attrs()
+        else:
+            self._create_core_attrs()
 
         if rebuild_mocks and isinstance(self._core_schema, _mock_val_ser.MockCoreSchema):
             self._core_schema.rebuild()
@@ -283,6 +276,29 @@ class TypeAdapter(Generic[T]):
             assert not isinstance(self._core_schema, _mock_val_ser.MockCoreSchema)
             assert not isinstance(self._validator, _mock_val_ser.MockValSer)
             assert not isinstance(self._serializer, _mock_val_ser.MockValSer)
+
+    @_frame_depth(1)
+    def _create_core_attrs(self) -> None:
+        config_wrapper = _config.ConfigWrapper(self._config)
+        core_config = config_wrapper.core_config(None)
+
+        self._core_schema = _get_schema(
+            self._type,
+            config_wrapper,
+            parent_depth=self._parent_depth,
+            skip_schema_cache=self._skip_schema_cache,
+            schema_generation_hooks=self._schema_generation_hooks,
+        )
+        self._validator = create_schema_validator(
+            schema=self._core_schema,
+            schema_type=self._type,
+            schema_type_module=self._module_name,
+            schema_type_name=str(self._type),
+            schema_kind='TypeAdapter',
+            config=core_config,
+            plugin_settings=config_wrapper.plugin_settings,
+        )
+        self._serializer = SchemaSerializer(self._core_schema, core_config)
 
     @cached_property
     @_frame_depth(2)  # +2 for @cached_property and core_schema(self)

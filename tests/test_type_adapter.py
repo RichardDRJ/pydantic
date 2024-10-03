@@ -2,10 +2,23 @@ import json
 import sys
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Any, Dict, ForwardRef, Generic, List, NamedTuple, Optional, Tuple, TypeVar, Union
+from typing import (
+    Any,
+    Dict,
+    ForwardRef,
+    Generic,
+    Iterable,
+    List,
+    NamedTuple,
+    Optional,
+    Tuple,
+    TypeVar,
+    Union,
+    get_origin,
+)
 
 import pytest
-from pydantic_core import ValidationError
+from pydantic_core import CoreSchema, ValidationError, core_schema
 from typing_extensions import Annotated, TypeAlias, TypedDict
 
 from pydantic import BaseModel, Field, TypeAdapter, ValidationInfo, create_model, field_validator
@@ -13,6 +26,7 @@ from pydantic._internal._typing_extra import annotated_type
 from pydantic.config import ConfigDict
 from pydantic.dataclasses import dataclass as pydantic_dataclass
 from pydantic.errors import PydanticUserError
+from pydantic.hooks import WrappedCoreSchemaGenerator
 from pydantic.type_adapter import _type_has_config
 
 ItemType = TypeVar('ItemType')
@@ -559,3 +573,149 @@ def test_core_schema_respects_defer_build(model: Any, config: ConfigDict, method
     assert type_adapter._core_schema is not None, 'Should be initialized after the usage'
     assert type_adapter._validator is not None, 'Should be initialized after the usage'
     assert type_adapter._serializer is not None, 'Should be initialized after the usage'
+
+
+def str_dict_schema_hook(obj: Any, handler: WrappedCoreSchemaGenerator) -> CoreSchema:
+    if obj == dict[str, str]:
+        schema = handler(obj).copy()
+        schema['serialization'] = core_schema.plain_serializer_function_ser_schema(
+            lambda x: f'str dict with length: {len(x)}', return_schema=core_schema.str_schema()
+        )
+        return schema
+    return handler(obj)
+
+
+def str_iterable_schema_hook(obj: Any, handler: WrappedCoreSchemaGenerator) -> CoreSchema:
+    if obj == Iterable[str]:
+        schema = handler(obj).copy()
+        schema['serialization'] = core_schema.plain_serializer_function_ser_schema(
+            lambda x: f'str iterable: {[*x]}', return_schema=core_schema.str_schema()
+        )
+        return schema
+    return handler(obj)
+
+
+def generic_iterable_schema_hook(obj: Any, handler: WrappedCoreSchemaGenerator) -> CoreSchema:
+    if obj == Iterable or get_origin(obj) == get_origin(Iterable):
+        schema = handler(obj).copy()
+        schema['serialization'] = core_schema.plain_serializer_function_ser_schema(
+            lambda x: f'generic iterable: {[*x]}', return_schema=core_schema.str_schema()
+        )
+        return schema
+    return handler(obj)
+
+
+def test_schema_hooks() -> None:
+    class Model(BaseModel):
+        str_iterable: Iterable[str]
+        str_dict: dict[str, str]
+        int_dict: dict[str, int]
+
+    model = Model(
+        str_iterable=['a', 'b', 'c'],
+        str_dict={'a': 'b'},
+        int_dict={'c': 3},
+    )
+
+    adapter = TypeAdapter(
+        Model,
+        schema_generation_hooks=[
+            str_iterable_schema_hook,
+            str_dict_schema_hook,
+        ],
+    )
+
+    assert adapter.dump_python(model) == {
+        'int_dict': {'c': 3},
+        'str_iterable': "str iterable: ['a', 'b', 'c']",
+        'str_dict': 'str dict with length: 1',
+    }
+
+
+def test_later_schema_hooks_take_precedence() -> None:
+    class Model(BaseModel):
+        str_iterable: Iterable[str]
+        generic_iterable: Iterable[int]
+
+    model = Model(
+        str_iterable=['a', 'b', 'c'],
+        generic_iterable=[*range(3)],
+    )
+
+    adapter = TypeAdapter(
+        Model,
+        schema_generation_hooks=[
+            str_iterable_schema_hook,
+            generic_iterable_schema_hook,
+        ],
+    )
+
+    assert adapter.dump_python(model) == {
+        'str_iterable': "generic iterable: ['a', 'b', 'c']",
+        'generic_iterable': 'generic iterable: [0, 1, 2]',
+    }
+
+
+def test_define_schema_hooks_at_root_level_for_recursive_use() -> None:
+    class NestedInnerModel(BaseModel):
+        str_iterable: Iterable[str]
+
+    class InnerModel(BaseModel):
+        str_iterable: Iterable[str]
+        nested_inner: NestedInnerModel
+
+    class Model(BaseModel):
+        inner: InnerModel
+
+    adapter = TypeAdapter(
+        Model,
+        schema_generation_hooks=[generic_iterable_schema_hook],
+    )
+
+    model = Model(
+        inner=InnerModel(str_iterable=['a', 'b', 'c'], nested_inner=NestedInnerModel(str_iterable=['d', 'e', 'f']))
+    )
+    assert adapter.dump_python(model) == {
+        'inner': {
+            'str_iterable': "generic iterable: ['a', 'b', 'c']",
+            'nested_inner': {
+                'str_iterable': "generic iterable: ['d', 'e', 'f']",
+            },
+        }
+    }
+
+
+def enforce_positive_int_schema_hook(obj: Any, handler: WrappedCoreSchemaGenerator) -> CoreSchema:
+    def is_positive(x: int):
+        if x <= 0:
+            raise ValueError('Value should be positive')
+        return x
+
+    if obj == int:
+        schema = handler(obj)
+        return core_schema.no_info_after_validator_function(function=is_positive, schema=schema)
+    return handler(obj)
+
+
+def test_schema_hooks_can_add_validation() -> None:
+    class Model(BaseModel):
+        int_list: list[int]
+
+    adapter = TypeAdapter(
+        Model,
+        schema_generation_hooks=[enforce_positive_int_schema_hook],
+    )
+
+    model = adapter.validate_python(
+        {
+            'int_list': [1, 2, 3],
+        }
+    )
+    assert model == Model(int_list=[1, 2, 3])
+
+    with pytest.raises(ValidationError):
+        adapter.validate_python(
+            {
+                'int_list': [-1, 2, 3],
+            }
+        )

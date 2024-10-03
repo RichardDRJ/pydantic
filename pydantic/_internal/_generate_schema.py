@@ -17,7 +17,7 @@ from copy import copy, deepcopy
 from decimal import Decimal
 from enum import Enum
 from fractions import Fraction
-from functools import partial
+from functools import partial, reduce
 from inspect import Parameter, _ParameterKind, signature
 from ipaddress import IPv4Address, IPv4Interface, IPv4Network, IPv6Address, IPv6Interface, IPv6Network
 from itertools import chain
@@ -54,6 +54,8 @@ from pydantic_core import (
     to_jsonable_python,
 )
 from typing_extensions import Literal, TypeAliasType, TypedDict, get_args, get_origin, is_typeddict
+
+from pydantic.hooks import CoreSchemaGeneratorFunction
 
 from ..aliases import AliasChoices, AliasGenerator, AliasPath
 from ..annotated_handlers import GetCoreSchemaHandler, GetJsonSchemaHandler
@@ -360,6 +362,8 @@ class GenerateSchema:
         '_config_wrapper_stack',
         '_types_namespace_stack',
         '_typevars_map',
+        '_schema_generation_hooks',
+        '_skip_schema_cache',
         'field_name_stack',
         'model_type_stack',
         'defs',
@@ -370,11 +374,15 @@ class GenerateSchema:
         config_wrapper: ConfigWrapper,
         types_namespace: dict[str, Any] | None,
         typevars_map: dict[Any, Any] | None = None,
+        skip_schema_cache: bool = False,
+        schema_generation_hooks: list[CoreSchemaGeneratorFunction] | None = None,
     ) -> None:
         # we need a stack for recursing into nested models
         self._config_wrapper_stack = ConfigWrapperStack(config_wrapper)
         self._types_namespace_stack = TypesNamespaceStack(types_namespace)
         self._typevars_map = typevars_map
+        self._schema_generation_hooks = schema_generation_hooks or []
+        self._skip_schema_cache = skip_schema_cache
         self.field_name_stack = _FieldNameStack()
         self.model_type_stack = _ModelTypeStack()
         self.defs = _Definitions()
@@ -801,13 +809,27 @@ class GenerateSchema:
         with self.defs.get_schema_or_ref(obj) as (_, maybe_schema):
             if maybe_schema is not None:
                 return maybe_schema
+
         if obj is source:
             ref_mode = 'unpack'
         else:
             ref_mode = 'to-def'
 
-        schema: CoreSchema
+        if self._skip_schema_cache:
+            if (
+                hasattr(obj, '__dict__')
+                # We check if the specific class we're dealing with defines __get_pydantic_core_schema__;
+                # if so, it's likely that it's a user-defined method with actual logic in it which we want
+                # to use (as opposed to the default which comes from BaseModel and just falls back on the
+                # cache).
+                and (get_schema := obj.__dict__.get('__get_pydantic_core_schema__')) is not None
+            ):
+                return get_schema(
+                    source, CallbackGetCoreSchemaHandler(self._generate_schema_inner, self, ref_mode=ref_mode)
+                )
+            return None
 
+        schema: CoreSchema
         if (get_schema := getattr(obj, '__get_pydantic_core_schema__', None)) is not None:
             schema = get_schema(
                 source, CallbackGetCoreSchemaHandler(self._generate_schema_inner, self, ref_mode=ref_mode)
@@ -905,7 +927,7 @@ class GenerateSchema:
             raise TypeError(f'Expected two type arguments for {origin}, got 1')
         return args[0], args[1]
 
-    def _generate_schema_inner(self, obj: Any) -> core_schema.CoreSchema:
+    def _default_generate_schema(self, obj: Any) -> core_schema.CoreSchema:
         if is_annotated(obj):
             return self._annotated_schema(obj)
 
@@ -929,6 +951,12 @@ class GenerateSchema:
             return core_schema.definition_reference_schema(schema_ref=obj.type_ref)
 
         return self.match_type(obj)
+
+    def _generate_schema_inner(self, obj: Any) -> CoreSchema:
+        generate = reduce(
+            lambda next, curr: lambda obj: curr(obj, next), self._schema_generation_hooks, self._default_generate_schema
+        )
+        return generate(obj)
 
     def match_type(self, obj: Any) -> core_schema.CoreSchema:  # noqa: C901
         """Main mapping of types to schemas.
